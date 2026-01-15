@@ -1,0 +1,20 @@
+{
+    "rotate_180": false,
+    "mirror": true,
+    "show_video": false,
+    "growth_speed": 7,
+    "recovery_speed": 21,
+    "check_interval": 5,
+    "enable_head": true,
+    "enable_back": true,
+    "enable_shoulder": true,
+    "head_sensitivity": 95,
+    "back_sensitivity": 88,
+    "shoulder_tolerance": 126,
+    "face_forward_sens": 95,
+    "face_down_sens": 95,
+    "enable_sedentary": true,
+    "sedentary_minutes": 30,
+    "last_slogan_date": "2026-01-15",
+    "current_slogan": "简化，细分，缩短，放慢。"
+}
