@@ -3,26 +3,367 @@ PySide6 坐姿矫正辅助系统
 迁移自 Tkinter 版本，性能优化，UI更流畅
 """
 
+import os
+import sys
+
+from PySide6.QtCore import QLibraryInfo
+
+
+def _pin_pyside6_qt_plugins():
+    """强制 Qt 使用 PySide6 的插件目录，规避 OpenCV 的 Qt 插件冲突。"""
+    plugins_root = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+    if not plugins_root:
+        return
+    os.environ["QT_PLUGIN_PATH"] = plugins_root
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(plugins_root, "platforms")
+
+
+# 先固定 Qt 插件路径，再导入其他可能改写该路径的库（如 cv2）
+_pin_pyside6_qt_plugins()
+
 import cv2
 import mediapipe as mp
 import numpy as np
 import math
 from collections import deque
-import pyttsx3
 import threading
 import time
-import sys
+import queue
 import json
-import os
 import random
+import tempfile
+import subprocess
+import shutil
+import hashlib
 from datetime import date
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QSlider, QCheckBox, QGroupBox, QFrame, QScrollArea, QComboBox, QProgressBar
+    QPushButton, QLabel, QSlider, QCheckBox, QGroupBox, QFrame, QScrollArea, QComboBox, QProgressBar, QSizePolicy
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize
 from PySide6.QtGui import QImage, QPixmap, QPalette, QColor, QFont
+
+# 某些 OpenCV 构建会在导入后覆盖 Qt 插件路径，这里再次锁定到 PySide6。
+_pin_pyside6_qt_plugins()
+
+
+_TTS_WORKER_STARTED = False
+_TTS_WORKER_LOCK = threading.Lock()
+_TTS_QUEUE = queue.Queue(maxsize=12)
+_TTS_DEDUP_LOCK = threading.Lock()
+_LAST_TTS_TEXT = ""
+_LAST_TTS_TS = 0.0
+_TTS_BACKEND = None
+_TTS_DISABLED_NOTICE_PRINTED = False
+_EDGE_GEN_TIMEOUT_SEC = 8
+_EDGE_PROBE_TIMEOUT_SEC = 6
+_EDGE_FAIL_LOCK = threading.Lock()
+_EDGE_FAIL_COUNT = 0
+_EDGE_DISABLED_UNTIL = 0.0
+_EDGE_RETRY_BASE_SEC = 10
+_EDGE_RETRY_MAX_SEC = 180
+_EDGE_PRECACHE_STARTED = False
+_EDGE_PRECACHE_LOCK = threading.Lock()
+_TTS_CACHE_DIR = os.path.join(os.path.dirname(__file__), "data", "tts_cache")
+_EDGE_PRECACHE_TEXTS = [
+    "坐姿风险较高，请立即调整。",
+    "请注意坐姿。",
+    "久坐提醒，请起身活动。",
+    "摄像头连接异常，请检查摄像头是否可用。",
+]
+
+
+def _normalize_tts_text(text):
+    if text is None:
+        return ""
+    normalized = str(text).strip()
+    replace_map = {
+        "⚠️": "",
+        ":": "，",
+        "：": "，",
+        "/": "和",
+        "、": "，",
+        "!": "。",
+        "！": "。",
+        ";": "，",
+        "；": "，",
+    }
+    for k, v in replace_map.items():
+        normalized = normalized.replace(k, v)
+    while "，，" in normalized:
+        normalized = normalized.replace("，，", "，")
+    if normalized and normalized[-1] not in "。！？":
+        normalized += "。"
+    return normalized
+
+
+def _detect_tts_backend():
+    """自动选择语音后端：仅使用 edge-tts。"""
+    preferred = os.environ.get("POSTURE_TTS_BACKEND", "").strip().lower()
+    if preferred == "pyttsx3":
+        print("[语音播报] pyttsx3 已弃用，已忽略该设置。")
+    if preferred == "edge":
+        return preferred
+
+    if shutil.which("edge-tts") and (shutil.which("gst-play-1.0") or shutil.which("paplay") or shutil.which("aplay")):
+        if not _probe_edge_tts():
+            print("[语音播报] edge-tts 连通性异常，先使用临时回退，稍后自动重试 edge。")
+        return "edge"
+    return "none"
+
+
+def _probe_edge_tts():
+    """快速探测 edge-tts 是否可用，避免首次播报长时间卡顿。"""
+    edge_cmd = shutil.which("edge-tts")
+    if not edge_cmd:
+        return False
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmpf:
+            tmp_path = tmpf.name
+        cmd = [
+            edge_cmd,
+            "--voice", "zh-CN-XiaoxiaoNeural",
+            "--text", "测试",
+            "--write-media", tmp_path,
+        ]
+        proxy = os.environ.get("POSTURE_TTS_PROXY", "").strip()
+        if proxy:
+            cmd.extend(["--proxy", proxy])
+        gen = subprocess.run(cmd, capture_output=True, text=True, timeout=_EDGE_PROBE_TIMEOUT_SEC)
+        if gen.returncode != 0:
+            return False
+        return os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0
+    except Exception:
+        return False
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _edge_available_now():
+    with _EDGE_FAIL_LOCK:
+        return time.time() >= _EDGE_DISABLED_UNTIL
+
+
+def _mark_edge_success():
+    global _EDGE_FAIL_COUNT, _EDGE_DISABLED_UNTIL
+    with _EDGE_FAIL_LOCK:
+        _EDGE_FAIL_COUNT = 0
+        _EDGE_DISABLED_UNTIL = 0.0
+
+
+def _mark_edge_failure():
+    global _EDGE_FAIL_COUNT, _EDGE_DISABLED_UNTIL
+    with _EDGE_FAIL_LOCK:
+        _EDGE_FAIL_COUNT += 1
+        backoff = min(_EDGE_RETRY_MAX_SEC, _EDGE_RETRY_BASE_SEC * (2 ** (_EDGE_FAIL_COUNT - 1)))
+        _EDGE_DISABLED_UNTIL = time.time() + backoff
+        return _EDGE_FAIL_COUNT, int(backoff)
+
+
+def _edge_cache_path(text):
+    normalized = _normalize_tts_text(text)
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+    return os.path.join(_TTS_CACHE_DIR, f"{digest}.mp3")
+
+
+def _has_valid_audio_file(path):
+    return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
+
+
+def _build_edge_cmd(edge_cmd, text, output_path):
+    cmd = [
+        edge_cmd,
+        "--voice", "zh-CN-XiaoxiaoNeural",
+        "--rate=-6%",
+        "--pitch=+2Hz",
+        "--text", text,
+        "--write-media", output_path,
+    ]
+    proxy = os.environ.get("POSTURE_TTS_PROXY", "").strip()
+    if proxy:
+        cmd.extend(["--proxy", proxy])
+    return cmd
+
+
+def _generate_edge_audio_file(edge_cmd, text, out_path, timeout_sec):
+    try:
+        os.makedirs(_TTS_CACHE_DIR, exist_ok=True)
+        tmp_out = f"{out_path}.tmp"
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+        cmd = _build_edge_cmd(edge_cmd, text, tmp_out)
+        gen = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        if gen.returncode != 0:
+            err = (gen.stderr or "").strip()
+            print(f"[语音播报] edge-tts 生成失败: {err}")
+            return False
+        if not _has_valid_audio_file(tmp_out):
+            print("[语音播报] edge-tts 生成的音频文件为空。")
+            return False
+        os.replace(tmp_out, out_path)
+        return True
+    except Exception as e:
+        print(f"[语音播报] edge-tts 播放异常: {e}")
+        return False
+    finally:
+        tmp_out = f"{out_path}.tmp"
+        if os.path.exists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except Exception:
+                pass
+
+
+def _precache_edge_phrases_async():
+    global _EDGE_PRECACHE_STARTED
+    with _EDGE_PRECACHE_LOCK:
+        if _EDGE_PRECACHE_STARTED:
+            return
+        _EDGE_PRECACHE_STARTED = True
+
+    def run_precache():
+        edge_cmd = shutil.which("edge-tts")
+        if not edge_cmd:
+            return
+        for phrase in _EDGE_PRECACHE_TEXTS:
+            text = _normalize_tts_text(phrase)
+            cache_path = _edge_cache_path(text)
+            if _has_valid_audio_file(cache_path):
+                continue
+            if not _edge_available_now():
+                return
+            ok = _generate_edge_audio_file(edge_cmd, text, cache_path, timeout_sec=max(_EDGE_GEN_TIMEOUT_SEC, 12))
+            if ok:
+                _mark_edge_success()
+            else:
+                fail_count, backoff = _mark_edge_failure()
+                print(f"[语音播报] edge-tts 预缓存失败次数={fail_count}，{backoff}秒后重试。")
+                return
+        print("[语音播报] edge 常用语句缓存已就绪。")
+
+    threading.Thread(target=run_precache, daemon=True).start()
+
+
+def _play_audio_file(path):
+    """按可用播放器顺序尝试播放音频文件。"""
+    candidates = []
+    if shutil.which("gst-play-1.0"):
+        candidates.append(["gst-play-1.0", "-q", "--no-interactive", path])
+    if shutil.which("paplay"):
+        candidates.append(["paplay", path])
+    if shutil.which("aplay"):
+        candidates.append(["aplay", path])
+
+    if not candidates:
+        print("[语音播报] 未找到可用音频播放器（gst-play/paplay/aplay）。")
+        return False
+
+    for cmd in candidates:
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0:
+                return True
+            err = (res.stderr or "").strip()
+            if err:
+                print(f"[语音播报] 播放器失败 ({cmd[0]}): {err}")
+        except Exception as e:
+            print(f"[语音播报] 播放器异常 ({cmd[0]}): {e}")
+    return False
+
+
+def _speak_with_edge_tts(text):
+    """使用 edge-tts 的中文女声（XiaoxiaoNeural）播报。"""
+    edge_cmd = shutil.which("edge-tts")
+    if not edge_cmd:
+        return False
+
+    cache_path = _edge_cache_path(text)
+    if not _has_valid_audio_file(cache_path):
+        ok = _generate_edge_audio_file(edge_cmd, text, cache_path, timeout_sec=_EDGE_GEN_TIMEOUT_SEC)
+        if not ok:
+            fail_count, backoff = _mark_edge_failure()
+            print(f"[语音播报] edge-tts 失败次数={fail_count}，{backoff}秒后重试。")
+            return False
+
+    if not _play_audio_file(cache_path):
+        print("[语音播报] 音频播放失败。")
+        return False
+    _mark_edge_success()
+    return True
+
+
+def _ensure_tts_worker():
+    global _TTS_WORKER_STARTED, _TTS_BACKEND, _TTS_DISABLED_NOTICE_PRINTED
+    with _TTS_WORKER_LOCK:
+        if _TTS_WORKER_STARTED:
+            return
+
+        _TTS_BACKEND = _detect_tts_backend()
+        print(f"[语音播报] 当前语音后端: {_TTS_BACKEND}")
+        if _TTS_BACKEND == "edge":
+            _precache_edge_phrases_async()
+        elif not _TTS_DISABLED_NOTICE_PRINTED:
+            print("[语音播报] 未检测到可用 edge-tts，语音播报将静默。")
+            _TTS_DISABLED_NOTICE_PRINTED = True
+
+        def worker_loop():
+            global _TTS_BACKEND, _TTS_DISABLED_NOTICE_PRINTED
+            while True:
+                text = _TTS_QUEUE.get()
+                try:
+                    use_edge = _TTS_BACKEND == "edge"
+                    if use_edge and _edge_available_now():
+                        ok = _speak_with_edge_tts(text)
+                        if not ok:
+                            print("[语音播报] edge-tts 本次失败，已跳过本次播报。")
+                    elif use_edge:
+                        print("[语音播报] edge-tts 暂时退避中，已跳过本次播报。")
+                    elif not _TTS_DISABLED_NOTICE_PRINTED:
+                        print("[语音播报] 未启用可用语音后端，已跳过播报。")
+                        _TTS_DISABLED_NOTICE_PRINTED = True
+                except Exception as e:
+                    print(f"[语音播报] 播放失败: {e}")
+                finally:
+                    _TTS_QUEUE.task_done()
+
+        threading.Thread(target=worker_loop, daemon=True).start()
+        _TTS_WORKER_STARTED = True
+
+
+def speak_chinese_async(text, rate=138):
+    """异步播报中文文本，使用单队列避免重叠抢播。"""
+    del rate  # 统一由 worker 维护语速，避免多处配置导致听感波动
+    normalized = _normalize_tts_text(text)
+    if not normalized:
+        return False
+
+    now = time.time()
+    with _TTS_DEDUP_LOCK:
+        global _LAST_TTS_TEXT, _LAST_TTS_TS
+        # 2 秒内的相同文案直接跳过，避免连续重复轰炸
+        if normalized == _LAST_TTS_TEXT and now - _LAST_TTS_TS < 2.0:
+            return True
+        _LAST_TTS_TEXT = normalized
+        _LAST_TTS_TS = now
+
+    _ensure_tts_worker()
+    try:
+        _TTS_QUEUE.put_nowait(normalized)
+    except queue.Full:
+        # 队列满时丢弃最旧消息，优先播报最新提醒
+        try:
+            _TTS_QUEUE.get_nowait()
+            _TTS_QUEUE.task_done()
+        except queue.Empty:
+            pass
+        _TTS_QUEUE.put_nowait(normalized)
+    return True
 
 # 初始化 MediaPipe
 mp_drawing = mp.solutions.drawing_utils
@@ -184,35 +525,23 @@ class PostureAnalyzer:
         if issues:
             core_issues = [i.split('/')[0].strip() for i in issues if i.strip()]
             if core_issues:
-                alert_text = "警告：" + "，".join(core_issues)
+                if any("久坐" in i for i in core_issues):
+                    alert_text = "久坐提醒，请起身活动。"
+                else:
+                    issue_text = "、".join(dict.fromkeys(core_issues))
+                    alert_text = f"检测到{issue_text}，请调整坐姿。"
 
         # ② 兜底语音（关键新增逻辑）
         if alert_text is None:
             if self.risk_score > 60:
-                alert_text = "警告"
+                alert_text = "坐姿风险较高，请立即调整。"
             elif self.risk_score > 25:
-                alert_text = "注意"
+                alert_text = "请注意坐姿。"
             else:
                 return False  # 安全兜底：不在提醒区间
 
         print(f"[语音播报] {alert_text}")
-
-        def speak_worker(text):
-            try:
-                engine = pyttsx3.init()
-                engine.setProperty('rate', 150)
-                engine.say(text)
-                engine.runAndWait()
-            except Exception as e:
-                print(f"[语音播报] 播放失败: {e}")
-
-        threading.Thread(
-            target=speak_worker,
-            args=(alert_text,),
-            daemon=True
-        ).start()
-
-        return True
+        return speak_chinese_async(alert_text, rate=150)
 
     def reset_sedentary_timer(self):
         self.sedentary_start_time = time.time()
@@ -339,35 +668,23 @@ class LaptopFaceAnalyzer:
         if issues:
             core_issues = [i.split('/')[0].strip() for i in issues if i.strip()]
             if core_issues:
-                alert_text = "注意，" + "，".join(core_issues)
+                if any("久坐" in i for i in core_issues):
+                    alert_text = "久坐提醒，请起身活动。"
+                else:
+                    issue_text = "、".join(dict.fromkeys(core_issues))
+                    alert_text = f"检测到{issue_text}，请调整坐姿。"
 
         # ② 兜底语音
         if alert_text is None:
             if self.risk_score > 60:
-                alert_text = "警告"
+                alert_text = "坐姿风险较高，请立即调整。"
             elif self.risk_score > 30:
-                alert_text = "注意"
+                alert_text = "请注意坐姿。"
             else:
                 return False
 
         print(f"[语音播报] {alert_text}")
-
-        def speak_worker(text):
-            try:
-                engine = pyttsx3.init()
-                engine.setProperty('rate', 150)
-                engine.say(text)
-                engine.runAndWait()
-            except Exception as e:
-                print(f"[语音播报] 播放失败: {e}")
-
-        threading.Thread(
-            target=speak_worker,
-            args=(alert_text,),
-            daemon=True
-        ).start()
-
-        return True
+        return speak_chinese_async(alert_text, rate=150)
 
     def set_forward_sensitivity(self, factor):
         self.FORWARD_MAX = self.BASE_FORWARD_MAX / (factor if factor > 0 else 1.0)
@@ -418,9 +735,13 @@ class VideoThread(QThread):
         
         # 状态控制相关
         self.calibration_countdown = 0
+        self.calibration_duration_sec = 3.0
+        self.calibration_deadline = 0.0
+        self.calibration_pending = False
         self.warmup_until = 0  # 用于记录预热截止时间戳
 
         self.calibration_data_buffer = [] # 用于存面部校准数据
+        self.pose_calibration_sample = None
 
     # 切换模式的方法
     def change_mode(self, mode_name):
@@ -433,14 +754,17 @@ class VideoThread(QThread):
 
     # 重新校准触发逻辑
     def start_calibration_countdown(self):
-        """初始化校准流程：重置分析器状态并开始倒计时"""
+        """初始化校准流程：重置分析器状态并开始严格 3 秒校准窗口。"""
         if self.mode == 'pose':
             self.analyzer.reset_calibration()
+            self.pose_calibration_sample = None
         else:
             self.face_analyzer.reset_calibration()
             self.calibration_data_buffer = []
-        
-        self.calibration_countdown = 90 # 约3秒（假设30fps）
+
+        self.calibration_deadline = time.monotonic() + self.calibration_duration_sec
+        self.calibration_pending = True
+        self.calibration_countdown = int(math.ceil(self.calibration_duration_sec))
     
     def run(self):
         """线程主循环：集成严格的唤醒判定与超时保护"""
@@ -525,9 +849,16 @@ class VideoThread(QThread):
             results = None
             posture_data = None
             
+            now_mono = time.monotonic()
+            if self.calibration_pending:
+                remaining = max(0.0, self.calibration_deadline - now_mono)
+                self.calibration_countdown = int(math.ceil(remaining))
+            else:
+                self.calibration_countdown = 0
+
             should_run_ai = (self.check_interval <= 0.01) or \
                            (current_time - self.last_check_time > self.check_interval) or \
-                           (self.calibration_countdown > 0)
+                           self.calibration_pending
             
             if should_run_ai:
                 img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -540,10 +871,8 @@ class VideoThread(QThread):
                     if results.pose_landmarks:
                         posture_data = self.analyzer.analyze_posture(results.pose_landmarks.landmark)
                         posture_data['dt'] = dt_to_process 
-                        if self.calibration_countdown > 0:
-                            self.calibration_countdown -= 1
-                            if self.calibration_countdown == 1:
-                                self.analyzer.calibrate(posture_data)
+                        if self.calibration_pending and now_mono < self.calibration_deadline:
+                            self.pose_calibration_sample = posture_data
 
                 elif self.mode == 'face' and self.face_mesh:
                     results = self.face_mesh.process(img_rgb)
@@ -551,12 +880,21 @@ class VideoThread(QThread):
                     if results.multi_face_landmarks:
                         face_lm = results.multi_face_landmarks[0].landmark
                         posture_data = self.face_analyzer.analyze_face(face_lm, w, h, dt_to_process)
-                        if self.calibration_countdown > 0:
+                        if self.calibration_pending and now_mono < self.calibration_deadline:
                             self.calibration_data_buffer.append(posture_data)
-                            self.calibration_countdown -= 1
-                            if self.calibration_countdown == 1:
-                                self.face_analyzer.calibrate(self.calibration_data_buffer)
-                                self.calibration_data_buffer = []
+
+            # 严格时间结束即完成校准，不再依赖帧率。
+            if self.calibration_pending and time.monotonic() >= self.calibration_deadline:
+                if self.mode == 'pose':
+                    if self.pose_calibration_sample:
+                        self.analyzer.calibrate(self.pose_calibration_sample)
+                    self.pose_calibration_sample = None
+                else:
+                    if self.calibration_data_buffer:
+                        self.face_analyzer.calibrate(self.calibration_data_buffer)
+                    self.calibration_data_buffer = []
+                self.calibration_pending = False
+                self.calibration_countdown = 0
 
             # 发送数据
             self.frame_ready.emit({
@@ -601,16 +939,30 @@ class VideoThread(QThread):
 
 
 # --- 在主窗口类定义前添加辅助函数 ---
+class CtrlWheelSlider(QSlider):
+    """仅在按住 Ctrl 时响应滚轮，避免误改参数。"""
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier:
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
 def create_slider_row(label_text, min_v, max_v, def_v, callback):
     """辅助函数：创建带标签、滑块和数值显示的行布局"""
     row_layout = QHBoxLayout()
+    row_layout.setContentsMargins(0, 2, 0, 2)
+    row_layout.setSpacing(8)
     label = QLabel(label_text)
-    label.setFixedWidth(100)
-    slider = QSlider(Qt.Horizontal)
+    label.setFixedWidth(108)
+    slider = CtrlWheelSlider(Qt.Horizontal)
+    slider.setMinimumWidth(120)
+    slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
     slider.setRange(min_v, max_v)
     slider.setValue(def_v)
     val_label = QLabel(str(def_v))
-    val_label.setFixedWidth(45)
+    val_label.setFixedWidth(78)
+    val_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
     
     slider.valueChanged.connect(lambda v: (val_label.setText(str(v)), callback(v)))
     
@@ -624,31 +976,35 @@ class PostureMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("坐姿矫正辅助系统 (AI Posture Assistant) - PySide6")
-        self.setMinimumSize(1200, 750)
+        self.setMinimumSize(1280, 780)
+        self.video_width = 820
+        self.video_height = 620
         
         # 1. 首先初始化所有需要被引用的成员变量 (Widget 实例)
         self.init_ui_components()
+        self.apply_global_style()
         
         # 2. 设置布局
         central_widget = QWidget()
+        central_widget.setObjectName("root")
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(14)
         
         # ==================== 左侧：展示区 (寄语 + 视频) ====================
         # 优化左侧布局结构，实现视频向上吸附
         left_container = QVBoxLayout()
-        left_container.setSpacing(10)
+        left_container.setSpacing(12)
         
         # 1. 将寄语标签加入布局 (居中对齐)
         left_container.addWidget(self.slogan_label, 0, Qt.AlignHCenter)
         
         # 2. 视频显示区配置
         self.video_label = QLabel()
-        self.video_label.setMinimumSize(800, 600)
-        self.video_label.setMaximumSize(800, 600)
-        self.video_label.setStyleSheet("background-color: black; border: 2px solid #555; border-radius: 10px;")
+        self.video_label.setObjectName("videoCanvas")
+        self.video_label.setMinimumSize(self.video_width, self.video_height)
+        self.video_label.setMaximumSize(self.video_width, self.video_height)
         self.video_label.setAlignment(Qt.AlignCenter)
         left_container.addWidget(self.video_label, 0, Qt.AlignHCenter)
         
@@ -659,10 +1015,11 @@ class PostureMainWindow(QMainWindow):
         
         # ==================== 右侧：控制面板 ====================
         control_panel = QWidget()
-        control_panel.setFixedWidth(380)
+        control_panel.setObjectName("controlPanel")
+        control_panel.setFixedWidth(420)
         control_layout = QVBoxLayout(control_panel)
-        control_layout.setContentsMargins(5, 5, 5, 5)
-        control_layout.setSpacing(10)
+        control_layout.setContentsMargins(6, 6, 6, 6)
+        control_layout.setSpacing(12)
         main_layout.addWidget(control_panel)
 
         # A. 状态与风险监控区 (置顶)
@@ -686,8 +1043,8 @@ class PostureMainWindow(QMainWindow):
 
         # C. 校准按钮 (置底)
         self.calibrate_btn = QPushButton("校准坐姿 (3秒倒计时)")
+        self.calibrate_btn.setObjectName("primaryButton")
         self.calibrate_btn.setMinimumHeight(50)
-        self.calibrate_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; font-size: 16px; border-radius: 8px;")
         self.calibrate_btn.setToolTip("按 F5 快速校准")  # 添加快捷键提示
         self.calibrate_btn.clicked.connect(self.start_calibration)
         control_layout.addWidget(self.calibrate_btn)
@@ -700,7 +1057,7 @@ class PostureMainWindow(QMainWindow):
         # 缓存与黑屏占位图
         self.cached_status = "Uncalibrated"
         self.cached_issues = []
-        self.black_pixmap = QPixmap(800, 600)
+        self.black_pixmap = QPixmap(self.video_width, self.video_height)
         self.black_pixmap.fill(QColor(0, 0, 0))
         self.hidden_pixmap = self.black_pixmap.copy()
         from PySide6.QtGui import QPainter
@@ -718,19 +1075,208 @@ class PostureMainWindow(QMainWindow):
         calibrate_shortcut = QShortcut(QKeySequence("F5"), self)
         calibrate_shortcut.activated.connect(self.start_calibration)
 
+    def apply_global_style(self):
+        self.setStyleSheet("""
+            #root {
+                background-color: #161b22;
+            }
+            QWidget {
+                color: #e6edf3;
+                font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+                font-size: 14px;
+            }
+            #controlPanel {
+                background: #1f2630;
+                border: 1px solid #2f3845;
+                border-radius: 14px;
+            }
+            #sloganCard {
+                background: #d8dee7;
+                color: #2e3640;
+                border: 1px solid #c6ced9;
+                border-radius: 10px;
+                padding: 12px 14px;
+                font-size: 22px;
+                font-style: italic;
+                font-weight: 600;
+            }
+            #videoCanvas {
+                background: #05070a;
+                border: 2px solid #303947;
+                border-radius: 12px;
+            }
+            QGroupBox {
+                background: #222b36;
+                border: 1px solid #3a4758;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding: 10px 10px 12px 10px;
+                font-weight: 700;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #f0f6fc;
+                background: #222b36;
+            }
+            QComboBox, QPushButton {
+                min-height: 32px;
+                border-radius: 8px;
+                border: 1px solid #3b485a;
+                background: #2b3644;
+                padding: 4px 10px;
+            }
+            QComboBox::drop-down {
+                width: 26px;
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                background: #2a333f;
+                color: #e6edf3;
+                border: 1px solid #3b485a;
+                selection-background-color: #335d96;
+            }
+            QPushButton:hover {
+                background: #344355;
+            }
+            QPushButton:checked {
+                background: #4a2f2f;
+                border-color: #8c4d4d;
+            }
+            #primaryButton {
+                background: #3ca85a;
+                color: #ffffff;
+                border: 1px solid #5ec878;
+                font-size: 17px;
+                font-weight: 800;
+            }
+            #primaryButton:hover {
+                background: #49bf67;
+            }
+            #modeHint {
+                color: #9fb0c3;
+                font-size: 12px;
+            }
+            #thresholdInfo {
+                color: #9fb0c3;
+            }
+            #statusBanner {
+                padding: 12px;
+                border-radius: 10px;
+                border: 1px solid #445366;
+                background: #273240;
+                color: #e6edf3;
+                font-size: 17px;
+                font-weight: 700;
+            }
+            #countdownPill {
+                min-height: 36px;
+                border-radius: 8px;
+                background: #26384f;
+                color: #dbeafe;
+                border: 1px solid #3a536f;
+                font-size: 22px;
+                font-weight: 800;
+            }
+            #riskBar {
+                border: 1px solid #3f4c5e;
+                border-radius: 6px;
+                background: #131922;
+            }
+            #riskBar::chunk {
+                border-radius: 5px;
+                background: #4CAF50;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #66768a;
+                border-radius: 3px;
+                background: #1a202a;
+            }
+            QCheckBox::indicator:checked {
+                background: #52a96b;
+                border-color: #6ed78c;
+            }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #17202b;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #6d77ff;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+                background: #cad4ff;
+                border: 1px solid #9ca9e3;
+            }
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+        """)
+
+    def _set_status_banner(self, text, state="neutral"):
+        styles = {
+            "neutral": ("#273240", "#445366", "#e6edf3"),
+            "info": ("#2a3441", "#4d6078", "#dbeafe"),
+            "good": ("#1f3a2b", "#2f6b46", "#c7f9d6"),
+            "attention": ("#463721", "#866430", "#ffe8ad"),
+            "warning": ("#482327", "#a74856", "#ffd8de"),
+            "error": ("#5c232b", "#c84f5d", "#ffe1e6"),
+            "paused": ("#313943", "#5a687a", "#d2d9e2"),
+        }
+        bg, border, fg = styles.get(state, styles["neutral"])
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(
+            f"padding: 12px; border-radius: 10px; background-color: {bg}; "
+            f"border: 1px solid {border}; color: {fg}; font-size: 17px; font-weight: 700;"
+        )
+
+    def _set_countdown_style(self, state="normal"):
+        styles = {
+            "normal": ("#26384f", "#3a536f", "#dbeafe"),
+            "soon": ("#4a3c23", "#8f7240", "#ffe7bb"),
+            "alert": ("#5d252d", "#cc4f5e", "#ffe2e7"),
+            "off": ("#2f3540", "#5f6979", "#c2c9d3"),
+        }
+        bg, border, fg = styles.get(state, styles["normal"])
+        self.countdown_label.setStyleSheet(
+            f"background-color: {bg}; color: {fg}; border: 1px solid {border}; "
+            "font-size: 22px; font-weight: 800; padding: 6px; border-radius: 8px;"
+        )
+
+    def _set_risk_bar_color(self, color):
+        self.risk_bar.setStyleSheet(
+            "QProgressBar#riskBar { border: 1px solid #3f4c5e; border-radius: 6px; background: #131922; }"
+            f"QProgressBar#riskBar::chunk {{ background: {color}; border-radius: 5px; }}"
+        )
+
     def init_ui_components(self):
         """预先实例化所有关键 UI 组件，防止引用错误"""
         self.status_label = QLabel("状态: 未校准")
+        self.status_label.setObjectName("statusBanner")
         self.risk_bar = QProgressBar()
+        self.risk_bar.setObjectName("riskBar")
         self.risk_score_label = QLabel("风险分: 0")
+        self.risk_score_label.setFont(QFont("Consolas", 14, QFont.Bold))
         self.threshold_info = QLabel("阈值: 注意>25 | 警告>60")
+        self.threshold_info.setObjectName("thresholdInfo")
         
         self.countdown_label = QLabel("久坐倒计时: --:--")
+        self.countdown_label.setObjectName("countdownPill")
         self.enable_sedentary_check = QCheckBox("启用久坐提醒")
         self.enable_sedentary_check.setChecked(True)
         self.enable_sedentary_check.stateChanged.connect(self.on_sedentary_toggle)
         self.reset_timer_btn = QPushButton("重置计时")
         self.reset_timer_btn.clicked.connect(self.reset_sedentary_timer)
+        self.test_tts_btn = QPushButton("测试语音播报")
+        self.test_tts_btn.clicked.connect(self.on_test_tts_clicked)
         
         self.body_settings_widget = QWidget()
         self.face_settings_widget = QWidget()
@@ -743,43 +1289,25 @@ class PostureMainWindow(QMainWindow):
 
         # 每日寄语组件初始化
         self.slogan_label = QLabel()
+        self.slogan_label.setObjectName("sloganCard")
         self.slogan_label.setAlignment(Qt.AlignCenter)
         self.slogan_label.setWordWrap(True)
-        # 固定宽度 800px 以对齐视频，设置最小高度保证美观
-        self.slogan_label.setFixedWidth(800)
+        # 固定宽度以对齐视频，设置最小高度保证美观
+        self.slogan_label.setFixedWidth(self.video_width)
         self.slogan_label.setMinimumHeight(60)
-        # 设置垂直尺寸策略为 Maximum，使其高度随内容自适应，不主动占领多余空间
-        from PySide6.QtWidgets import QSizePolicy
         self.slogan_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        
-        self.slogan_label.setStyleSheet("""
-            QLabel {
-                background-color: #fdfdfd;
-                color: #555555;
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                padding: 12px;
-                font-family: "Microsoft YaHei";
-                font-size: 15px;
-                font-style: italic;
-            }
-        """)
         self.current_slogan = ""
         self.last_slogan_date = ""
 
     def setup_monitor_section(self, layout):
-        group_style = "QGroupBox { font-weight: bold; border: 1px solid #dcdfe6; border-radius: 8px; margin-top: 10px; padding-top: 10px; }"
-        
         # 状态标签
         self.status_label.setMinimumHeight(65)
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
-        self.status_label.setStyleSheet("padding: 10px; background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px;")
+        self._set_status_banner("状态: 未校准 (请保持端正后点击校准)", "neutral")
         layout.addWidget(self.status_label)
 
         # 风险条
         risk_group = QGroupBox("实时风险监控")
-        risk_group.setStyleSheet(group_style)
         risk_l = QVBoxLayout(risk_group)
         self.risk_bar.setFixedHeight(12)
         self.risk_bar.setTextVisible(False)
@@ -795,7 +1323,6 @@ class PostureMainWindow(QMainWindow):
 
     def setup_config_section(self, layout):
         group = QGroupBox("系统配置")
-        group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #dcdfe6; border-radius: 8px; margin-top: 10px; padding-top: 10px; }")
         l = QVBoxLayout(group)
         
         l.addWidget(QLabel("摄像头源:"))
@@ -811,7 +1338,7 @@ class PostureMainWindow(QMainWindow):
         l.addWidget(self.mode_combo)
         
         self.mode_hint = QLabel("适合：全身/半身入镜")
-        self.mode_hint.setStyleSheet("color: #909399; font-size: 11px;")
+        self.mode_hint.setObjectName("modeHint")
         l.addWidget(self.mode_hint)
 
         c_l = QHBoxLayout()
@@ -819,6 +1346,7 @@ class PostureMainWindow(QMainWindow):
         self.mirror_check.stateChanged.connect(self.on_mirror_changed)
         self.show_video_check.setChecked(True)
         self.show_video_check.stateChanged.connect(self.on_show_video_changed)
+        self.rotate_180_check.stateChanged.connect(self.on_rotate_changed)
         c_l.addWidget(self.mirror_check); c_l.addWidget(self.show_video_check); c_l.addWidget(self.rotate_180_check)
         l.addLayout(c_l)
         
@@ -826,14 +1354,15 @@ class PostureMainWindow(QMainWindow):
         self.pause_btn.setCheckable(True)
         self.pause_btn.clicked.connect(self.toggle_pause)
         l.addWidget(self.pause_btn)
+
+        l.addWidget(self.test_tts_btn)
         layout.addWidget(group)
 
     def setup_sedentary_section(self, layout):
         group = QGroupBox("久坐提醒")
-        group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #dcdfe6; border-radius: 8px; margin-top: 10px; padding-top: 10px; }")
         l = QVBoxLayout(group)
-        self.countdown_label.setStyleSheet("font-size: 18px; color: #409eff; background: #ecf5ff; padding: 5px; border-radius: 4px;")
         self.countdown_label.setAlignment(Qt.AlignCenter)
+        self._set_countdown_style("normal")
         l.addWidget(self.countdown_label)
         
         ctrl_l = QHBoxLayout()
@@ -848,7 +1377,6 @@ class PostureMainWindow(QMainWindow):
 
     def setup_algorithm_section(self, layout):
         group = QGroupBox("算法灵敏度调整")
-        group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #dcdfe6; border-radius: 8px; margin-top: 10px; padding-top: 10px; }")
         vbox = QVBoxLayout(group)
         
         r1, self.growth_slider, self.growth_label = create_slider_row("风险增长:", 5, 50, 15, self.on_risk_speed_changed)
@@ -901,8 +1429,7 @@ class PostureMainWindow(QMainWindow):
             self.face_settings_widget.setVisible(True)
             self.threshold_info.setText("阈值: 注意>30 | 警告>60") # 面部模式阈值
         
-        self.status_label.setText("模式切换中...请重新校准")
-        self.status_label.setStyleSheet("padding: 15px; background-color: #f0f0f0; border-radius: 5px; color: black;")
+        self._set_status_banner("状态: 模式切换中，请重新校准", "info")
 
     # 面部模式参数回调
     def on_face_forward_changed(self, value):
@@ -985,14 +1512,7 @@ class PostureMainWindow(QMainWindow):
         self.video_thread.start_calibration_countdown()
         
         # 更新UI显示
-        self.status_label.setText("状态: 校准采集中，请保持端正姿势...")
-        self.status_label.setStyleSheet("""
-            padding: 15px; 
-            background-color: #fff3cd; 
-            border-radius: 5px; 
-            color: #856404; 
-            border: 2px solid #ffeeba;
-        """)
+        self._set_status_banner("状态: 校准采集中，请保持端正姿势...", "attention")
 
 
     def toggle_pause(self):
@@ -1002,8 +1522,7 @@ class PostureMainWindow(QMainWindow):
             self.pause_btn.setText("继续检测")
             # 立即清空画面为黑屏
             self.video_label.setPixmap(self.black_pixmap)
-            self.status_label.setText("状态: 已暂停")
-            self.status_label.setStyleSheet("padding: 15px; background-color: #e2e3e5; border-radius: 5px; color: #383d41;")
+            self._set_status_banner("状态: 已暂停", "paused")
         else:
             self.pause_btn.setText("暂停检测")
             # 恢复时先显示黑屏，等待线程唤醒
@@ -1038,7 +1557,11 @@ class PostureMainWindow(QMainWindow):
         # ✅ 同时重置两个分析器的计时器
         self.video_thread.analyzer.reset_sedentary_timer()
         self.video_thread.face_analyzer.reset_sedentary_timer()  
-        self.status_label.setText("状态: 久坐计时已重置")
+        self._set_status_banner("状态: 久坐计时已重置", "info")
+
+    def on_test_tts_clicked(self):
+        self._set_status_banner("状态: 正在测试语音播报", "info")
+        speak_chinese_async("语音播报测试成功")
     
     def update_frame(self, data):
         """更新视频帧及 UI 状态"""
@@ -1046,26 +1569,19 @@ class PostureMainWindow(QMainWindow):
         if error_msg:
             if error_msg == "CAMERA_WAKING_UP":
                 # 唤醒中：保持黑屏，仅更新状态标签
-                self.status_label.setText("状态: 正在唤醒摄像头...")
-                self.status_label.setStyleSheet("padding: 15px; background-color: #f8f9fa; border-radius: 5px; color: #6c757d;")
+                self._set_status_banner("状态: 正在唤醒摄像头...", "info")
                 self.video_label.setPixmap(self.black_pixmap)
                 return
 
             # 真实的异常处理：红色提示界面
             self.video_label.setPixmap(self.hidden_pixmap)
-            self.status_label.setText(error_msg)
-            self.status_label.setStyleSheet("padding: 15px; background-color: #f8d7da; border-radius: 5px; color: #721c24;")
+            self._set_status_banner(error_msg, "error")
             
             # 异常语音播报 (每30秒一次)
             current_time = time.time()
             if current_time - self.last_error_speech_time > 30.0:
                 self.last_error_speech_time = current_time
-                def speak_error():
-                    try:
-                        engine = pyttsx3.init(); engine.setProperty('rate', 150)
-                        engine.say("摄像头异常，请检查连接"); engine.runAndWait()
-                    except: pass
-                threading.Thread(target=speak_error, daemon=True).start()
+                speak_chinese_async("摄像头连接异常，请检查摄像头是否可用。")
             return
         
         frame = data['frame']
@@ -1079,16 +1595,15 @@ class PostureMainWindow(QMainWindow):
             elapsed_time = time.time() - self.video_thread.analyzer.sedentary_start_time
             remaining_seconds = self.video_thread.analyzer.sedentary_threshold - elapsed_time
             if remaining_seconds <= 0:
-                self.countdown_label.setText("⚠️ 该起身活动了！")
-                self.countdown_label.setStyleSheet("background-color: #ffebee; color: red; font-size: 18px; font-weight: bold; padding: 10px; border: 2px solid red; border-radius: 5px;")
+                self.countdown_label.setText("该起身活动了")
+                self._set_countdown_style("alert")
             else:
                 mins, secs = divmod(int(remaining_seconds), 60)
                 self.countdown_label.setText(f"久坐倒计时: {mins:02d}:{secs:02d}")
-                color = "#e67e22" if remaining_seconds < 300 else "#2c3e50"
-                self.countdown_label.setStyleSheet(f"color: {color}; font-size: 16px; font-weight: bold; padding: 10px; border: 2px dashed #ccc; border-radius: 5px;")
+                self._set_countdown_style("soon" if remaining_seconds < 300 else "normal")
         else:
             self.countdown_label.setText("久坐提醒: 已关闭")
-            self.countdown_label.setStyleSheet("color: gray; padding: 10px;")
+            self._set_countdown_style("off")
         
         # 3. 状态检查与缓存逻辑
         current_status = self.cached_status
@@ -1112,14 +1627,7 @@ class PostureMainWindow(QMainWindow):
         # ✅ 优先判断：如果正在校准中，保持校准提示，不更新其他状态
         if calibration_countdown > 0:
             # 校准进行中：保持显示校准提示文本和样式
-            self.status_label.setText("状态: 校准采集中，请保持端正姿势...")
-            self.status_label.setStyleSheet("""
-                padding: 15px; 
-                background-color: #fff3cd; 
-                border-radius: 5px; 
-                color: #856404; 
-                border: 2px solid #ffeeba;
-            """)
+            self._set_status_banner("状态: 校准采集中，请保持端正姿势...", "attention")
         elif is_calibrated:
             # 已校准：正常显示检测状态
             analyzer = self.video_thread.analyzer if current_mode == 'pose' else self.video_thread.face_analyzer
@@ -1129,21 +1637,17 @@ class PostureMainWindow(QMainWindow):
             
             att_val = 25 if current_mode == 'pose' else 30
             color = "#f44336" if score >= 60 else ("#ff9800" if score >= att_val else "#4CAF50")
-            self.risk_bar.setStyleSheet(f"QProgressBar {{ border: 1px solid #bbb; border-radius: 5px; background: #eee; }} QProgressBar::chunk {{ background: {color}; border-radius: 4px; }}")
+            self._set_risk_bar_color(color)
 
             if current_status == "Good":
-                self.status_label.setText("状态: 坐姿良好")
-                self.status_label.setStyleSheet("padding: 15px; background-color: #d4edda; border-radius: 5px; color: #155724;")
+                self._set_status_banner("状态: 坐姿良好", "good")
             elif current_status == "Attention":
-                self.status_label.setText("状态: 注意坐姿")
-                self.status_label.setStyleSheet("padding: 15px; background-color: #fff3cd; border-radius: 5px; color: #856404;")
+                self._set_status_banner("状态: 注意坐姿", "attention")
             elif current_status == "Warning":
-                self.status_label.setText(f"警告: {', '.join(current_issues)}")
-                self.status_label.setStyleSheet("padding: 15px; background-color: #f8d7da; border-radius: 5px; color: #721c24;")
+                self._set_status_banner(f"警告: {', '.join(current_issues)}", "warning")
         else:
             # 未校准状态
-            self.status_label.setText("状态: 未校准 (请保持端正后点击校准)")
-            self.status_label.setStyleSheet("padding: 15px; background-color: #f0f0f0; border-radius: 5px; color: black;")
+            self._set_status_banner("状态: 未校准 (请保持端正后点击校准)", "neutral")
 
         # 5. 绘图与显示
         if not self.video_thread.show_video:
@@ -1159,7 +1663,7 @@ class PostureMainWindow(QMainWindow):
                 for (px, py) in face_analyzer.draw_z_points: cv2.circle(frame, (px, py), 4, (0, 0, 255), -1)
 
         if calibration_countdown > 0:
-            text = f"Calibrating... {calibration_countdown//30 + 1}"
+            text = f"Calibrating... {calibration_countdown}"
             cv2.putText(frame, text, (frame.shape[1]//2 - 150, frame.shape[0]//2), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
         
         self.display_frame(frame)
@@ -1170,7 +1674,11 @@ class PostureMainWindow(QMainWindow):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
         qt_image = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qt_image).scaled(800, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.video_label.setPixmap(
+            QPixmap.fromImage(qt_image).scaled(
+                self.video_width, self.video_height, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        )
 
     # 添加保存/加载设置的方法 
     def save_settings(self):

@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+postcorr_env/
+.venv/
+venv/
+env/
+
+# Project runtime data
+data/tts_cache/
+user_settings.json
+
+# IDE and local tooling
+.codex
+.marscode/
+
+# Local process notes
+devlog.txt
+code_refine_codex.txt
