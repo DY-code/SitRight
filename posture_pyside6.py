@@ -1311,6 +1311,9 @@ class PostureMainWindow(QMainWindow):
         self.face_settings_widget.setVisible(False)
 
         # 摄像头开关
+        self.enable_posture_check = QCheckBox("启用坐姿检测")
+        self.enable_posture_check.setChecked(True)
+        self.enable_posture_check.stateChanged.connect(self.on_posture_check_toggle)
         self.mirror_check = QCheckBox("水平镜像")
         self.show_video_check = QCheckBox("实时画面")
         self.rotate_180_check = QCheckBox("旋转180°") 
@@ -1375,7 +1378,8 @@ class PostureMainWindow(QMainWindow):
         self.show_video_check.setChecked(True)
         self.show_video_check.stateChanged.connect(self.on_show_video_changed)
         self.rotate_180_check.stateChanged.connect(self.on_rotate_changed)
-        c_l.addWidget(self.mirror_check); c_l.addWidget(self.show_video_check); c_l.addWidget(self.rotate_180_check)
+        c_l.addWidget(self.enable_posture_check); c_l.addWidget(self.mirror_check)
+        c_l.addWidget(self.show_video_check); c_l.addWidget(self.rotate_180_check)
         l.addLayout(c_l)
         
         self.pause_btn = QPushButton("暂停检测")
@@ -1501,6 +1505,12 @@ class PostureMainWindow(QMainWindow):
     def on_show_video_changed(self, state):
         # 使用 isChecked() 直接获取布尔值，避免 PySide6 枚举类型比较失败的问题
         self.video_thread.show_video = self.show_video_check.isChecked()
+
+    def on_posture_check_toggle(self, state):
+        del state
+        if not self.enable_posture_check.isChecked():
+            self._reset_posture_risk_state()
+            self._set_status_banner("状态: 坐姿检测已关闭", "paused")
     
     def on_toggle_changed(self):
         self.video_thread.analyzer.enable_head = self.enable_head_check.isChecked()
@@ -1609,6 +1619,15 @@ class PostureMainWindow(QMainWindow):
             self.voice_volume_slider.value(),
             self.voice_mute_btn.isChecked()
         )
+
+    def _reset_posture_risk_state(self):
+        self.video_thread.analyzer.risk_score = 0.0
+        self.video_thread.face_analyzer.risk_score = 0.0
+        self.cached_status = "PostureDisabled"
+        self.cached_issues = []
+        self.risk_score_label.setText("风险分: 0")
+        self.risk_bar.setValue(0)
+        self._set_risk_bar_color("#4CAF50")
         
     def reset_sedentary_timer(self):
         # ✅ 同时重置两个分析器的计时器
@@ -1666,25 +1685,31 @@ class PostureMainWindow(QMainWindow):
         current_status = self.cached_status
         current_issues = self.cached_issues
         is_calibrated = False
+        posture_check_enabled = self.enable_posture_check.isChecked()
 
-        if current_mode == 'pose':
-            if self.video_thread.analyzer.calibrated:
-                is_calibrated = True
-                if posture_data:
-                    current_status, current_issues = self.video_thread.analyzer.check_posture(posture_data, posture_data.get('dt', 0.033))
-                    self.cached_status, self.cached_issues = current_status, current_issues
-        elif current_mode == 'face':
-            if self.video_thread.face_analyzer.calibrated:
-                is_calibrated = True
-                if posture_data:
-                    current_status, current_issues = self.video_thread.face_analyzer.check_posture(posture_data)
-                    self.cached_status, self.cached_issues = current_status, current_issues
+        if posture_check_enabled:
+            if current_mode == 'pose':
+                if self.video_thread.analyzer.calibrated:
+                    is_calibrated = True
+                    if posture_data:
+                        current_status, current_issues = self.video_thread.analyzer.check_posture(posture_data, posture_data.get('dt', 0.033))
+                        self.cached_status, self.cached_issues = current_status, current_issues
+            elif current_mode == 'face':
+                if self.video_thread.face_analyzer.calibrated:
+                    is_calibrated = True
+                    if posture_data:
+                        current_status, current_issues = self.video_thread.face_analyzer.check_posture(posture_data)
+                        self.cached_status, self.cached_issues = current_status, current_issues
+        else:
+            self._reset_posture_risk_state()
 
         # 4. 更新风险条与状态标签
         # ✅ 优先判断：如果正在校准中，保持校准提示，不更新其他状态
         if calibration_countdown > 0:
             # 校准进行中：保持显示校准提示文本和样式
             self._set_status_banner("状态: 校准采集中，请保持端正姿势...", "attention")
+        elif not posture_check_enabled:
+            self._set_status_banner("状态: 坐姿检测已关闭", "paused")
         elif is_calibrated:
             # 已校准：正常显示检测状态
             analyzer = self.video_thread.analyzer if current_mode == 'pose' else self.video_thread.face_analyzer
@@ -1742,6 +1767,7 @@ class PostureMainWindow(QMainWindow):
         """保存当前用户设置及寄语状态到 JSON 文件"""
         settings = {
             # 摄像头设置
+            "enable_posture_check": self.enable_posture_check.isChecked(),
             "rotate_180": self.rotate_180_check.isChecked(),
             "mirror": self.mirror_check.isChecked(),
             "show_video": self.show_video_check.isChecked(),
@@ -1797,6 +1823,7 @@ class PostureMainWindow(QMainWindow):
                 settings = json.load(f)
             
             # 摄像头设置
+            if "enable_posture_check" in settings: self.enable_posture_check.setChecked(settings["enable_posture_check"])
             if "rotate_180" in settings: self.rotate_180_check.setChecked(settings["rotate_180"])
             if "mirror" in settings: self.mirror_check.setChecked(settings["mirror"])
             if "show_video" in settings: self.show_video_check.setChecked(settings["show_video"])
