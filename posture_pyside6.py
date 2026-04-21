@@ -52,8 +52,11 @@ _TTS_WORKER_STARTED = False
 _TTS_WORKER_LOCK = threading.Lock()
 _TTS_QUEUE = queue.Queue(maxsize=12)
 _TTS_DEDUP_LOCK = threading.Lock()
+_TTS_VOLUME_LOCK = threading.Lock()
 _LAST_TTS_TEXT = ""
 _LAST_TTS_TS = 0.0
+_TTS_VOLUME = 80
+_TTS_MUTED = False
 _TTS_BACKEND = None
 _TTS_DISABLED_NOTICE_PRINTED = False
 _EDGE_GEN_TIMEOUT_SEC = 8
@@ -176,6 +179,19 @@ def _has_valid_audio_file(path):
     return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
 
 
+def set_tts_volume_state(volume, muted):
+    """更新语音播报音量状态，仅影响应用内 TTS 播放。"""
+    global _TTS_VOLUME, _TTS_MUTED
+    with _TTS_VOLUME_LOCK:
+        _TTS_VOLUME = max(0, min(100, int(volume)))
+        _TTS_MUTED = bool(muted)
+
+
+def get_tts_volume_state():
+    with _TTS_VOLUME_LOCK:
+        return _TTS_VOLUME, _TTS_MUTED
+
+
 def _build_edge_cmd(edge_cmd, text, output_path):
     cmd = [
         edge_cmd,
@@ -252,11 +268,16 @@ def _precache_edge_phrases_async():
 
 def _play_audio_file(path):
     """按可用播放器顺序尝试播放音频文件。"""
+    volume, muted = get_tts_volume_state()
+    if muted or volume <= 0:
+        return True
+
     candidates = []
     if shutil.which("gst-play-1.0"):
-        candidates.append(["gst-play-1.0", "-q", "--no-interactive", path])
+        candidates.append(["gst-play-1.0", "-q", "--no-interactive", f"--volume={volume / 100.0:.2f}", path])
     if shutil.which("paplay"):
-        candidates.append(["paplay", path])
+        pulse_volume = max(0, min(65536, int(65536 * volume / 100)))
+        candidates.append(["paplay", f"--volume={pulse_volume}", path])
     if shutil.which("aplay"):
         candidates.append(["aplay", path])
 
@@ -342,6 +363,9 @@ def speak_chinese_async(text, rate=138):
     normalized = _normalize_tts_text(text)
     if not normalized:
         return False
+    volume, muted = get_tts_volume_state()
+    if muted or volume <= 0:
+        return True
 
     now = time.time()
     with _TTS_DEDUP_LOCK:
@@ -1053,6 +1077,7 @@ class PostureMainWindow(QMainWindow):
         self.video_thread = VideoThread(video_source=0)
         self.video_thread.frame_ready.connect(self.update_frame)
         self.video_thread.start()
+        self.refresh_sensitivity_labels()
         
         # 缓存与黑屏占位图
         self.cached_status = "Uncalibrated"
@@ -1277,6 +1302,9 @@ class PostureMainWindow(QMainWindow):
         self.reset_timer_btn.clicked.connect(self.reset_sedentary_timer)
         self.test_tts_btn = QPushButton("测试语音播报")
         self.test_tts_btn.clicked.connect(self.on_test_tts_clicked)
+        self.voice_mute_btn = QPushButton("静音")
+        self.voice_mute_btn.setCheckable(True)
+        self.voice_mute_btn.toggled.connect(self.on_voice_mute_toggled)
         
         self.body_settings_widget = QWidget()
         self.face_settings_widget = QWidget()
@@ -1354,6 +1382,14 @@ class PostureMainWindow(QMainWindow):
         self.pause_btn.setCheckable(True)
         self.pause_btn.clicked.connect(self.toggle_pause)
         l.addWidget(self.pause_btn)
+
+        voice_l = QHBoxLayout()
+        voice_l.addWidget(QLabel("语音音量:"))
+        voice_l.addWidget(self.voice_mute_btn)
+        l.addLayout(voice_l)
+        row, self.voice_volume_slider, self.voice_volume_label = create_slider_row("音量:", 0, 100, 80, self.on_voice_volume_changed)
+        self.voice_volume_label.setText("80%")
+        l.addLayout(row)
 
         l.addWidget(self.test_tts_btn)
         layout.addWidget(group)
@@ -1441,6 +1477,13 @@ class PostureMainWindow(QMainWindow):
         factor = value / 100.0
         self.video_thread.face_analyzer.set_down_sensitivity(factor)
         self.face_down_label.setText(f"系数: {factor:.2f}")
+
+    def refresh_sensitivity_labels(self):
+        """统一刷新系数型灵敏度显示，避免显示滑块原始整数值。"""
+        self.on_head_sens_changed(self.head_slider.value())
+        self.on_back_sens_changed(self.back_slider.value())
+        self.on_face_forward_changed(self.face_forward_slider.value())
+        self.on_face_down_changed(self.face_down_slider.value())
 
     # 摄像头源切换回调
     def on_cam_source_changed(self, index):
@@ -1552,6 +1595,20 @@ class PostureMainWindow(QMainWindow):
         threshold_seconds = value * 60
         self.video_thread.analyzer.sedentary_threshold = threshold_seconds
         self.video_thread.face_analyzer.sedentary_threshold = threshold_seconds
+
+    def on_voice_mute_toggled(self, checked):
+        self.voice_mute_btn.setText("取消静音" if checked else "静音")
+        self._apply_voice_volume_state()
+
+    def on_voice_volume_changed(self, value):
+        self.voice_volume_label.setText(f"{value}%")
+        self._apply_voice_volume_state()
+
+    def _apply_voice_volume_state(self):
+        set_tts_volume_state(
+            self.voice_volume_slider.value(),
+            self.voice_mute_btn.isChecked()
+        )
         
     def reset_sedentary_timer(self):
         # ✅ 同时重置两个分析器的计时器
@@ -1710,6 +1767,10 @@ class PostureMainWindow(QMainWindow):
             "enable_sedentary": self.enable_sedentary_check.isChecked(),
             "sedentary_minutes": self.sedentary_slider.value(),
 
+            # 语音设置
+            "voice_muted": self.voice_mute_btn.isChecked(),
+            "voice_volume": self.voice_volume_slider.value(),
+
             # 寄语持久化
             "last_slogan_date": self.last_slogan_date,
             "current_slogan": self.current_slogan
@@ -1727,6 +1788,7 @@ class PostureMainWindow(QMainWindow):
         settings_path = "user_settings.json"
         if not os.path.exists(settings_path):
             # 若无配置文件，仍尝试加载今日寄语
+            self._apply_voice_volume_state()
             self._update_slogan_logic({})
             return
             
@@ -1755,10 +1817,16 @@ class PostureMainWindow(QMainWindow):
             if "shoulder_tolerance" in settings: self.shoulder_slider.setValue(settings["shoulder_tolerance"])
             if "face_forward_sens" in settings: self.face_forward_slider.setValue(settings["face_forward_sens"])
             if "face_down_sens" in settings: self.face_down_slider.setValue(settings["face_down_sens"])
+            self.refresh_sensitivity_labels()
             
             # 久坐设置
             if "enable_sedentary" in settings: self.enable_sedentary_check.setChecked(settings["enable_sedentary"])
             if "sedentary_minutes" in settings: self.sedentary_slider.setValue(settings["sedentary_minutes"])
+
+            # 语音设置
+            if "voice_volume" in settings: self.voice_volume_slider.setValue(settings["voice_volume"])
+            if "voice_muted" in settings: self.voice_mute_btn.setChecked(settings["voice_muted"])
+            self._apply_voice_volume_state()
             
             # 执行寄语更新逻辑
             self._update_slogan_logic(settings)
