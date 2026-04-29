@@ -533,6 +533,27 @@ class PostureAnalyzer:
             
         return status, issues
 
+    def check_sedentary_alert(self):
+        """独立检查久坐提醒，不依赖坐姿检测/校准状态。"""
+        if not self.enable_sedentary:
+            return False, []
+
+        current_time = time.time()
+        if current_time - self.sedentary_start_time <= self.sedentary_threshold:
+            self.sedentary_warning_sent = False
+            return False, []
+
+        issues = ["您已久坐，请起身活动！"]
+        if not self.sedentary_warning_sent:
+            self.last_speech_time = 0
+            self.sedentary_warning_sent = True
+
+        if current_time - self.last_speech_time > self.speech_cooldown:
+            triggered = self.trigger_voice_alert(issues)
+            if triggered:
+                self.last_speech_time = current_time
+        return True, issues
+
     # 功能：当 issues 为空时，根据当前风险分进行“兜底语音”
     def trigger_voice_alert(self, issues):
         """
@@ -676,6 +697,27 @@ class LaptopFaceAnalyzer:
                 self.last_speech_time = current_time
         
         return status, issues
+
+    def check_sedentary_alert(self):
+        """独立检查久坐提醒，不依赖坐姿检测/校准状态。"""
+        if not self.enable_sedentary:
+            return False, []
+
+        current_time = time.time()
+        if current_time - self.sedentary_start_time <= self.sedentary_threshold:
+            self.sedentary_warning_sent = False
+            return False, []
+
+        issues = ["您已久坐，请起身活动！"]
+        if not self.sedentary_warning_sent:
+            self.last_speech_time = 0
+            self.sedentary_warning_sent = True
+
+        if current_time - self.last_speech_time > self.speech_cooldown:
+            triggered = self.trigger_voice_alert(issues)
+            if triggered:
+                self.last_speech_time = current_time
+        return True, issues
 
     # 恢复旧版稳定实现 
     def trigger_voice_alert(self, issues):
@@ -1686,6 +1728,8 @@ class PostureMainWindow(QMainWindow):
         current_issues = self.cached_issues
         is_calibrated = False
         posture_check_enabled = self.enable_posture_check.isChecked()
+        sedentary_alert_active = False
+        sedentary_issues = []
 
         if posture_check_enabled:
             if current_mode == 'pose':
@@ -1702,6 +1746,10 @@ class PostureMainWindow(QMainWindow):
                         self.cached_status, self.cached_issues = current_status, current_issues
         else:
             self._reset_posture_risk_state()
+            sedentary_alert_active, sedentary_issues = self.video_thread.analyzer.check_sedentary_alert()
+            if sedentary_alert_active:
+                current_status = "Warning"
+                current_issues = sedentary_issues
 
         # 4. 更新风险条与状态标签
         # ✅ 优先判断：如果正在校准中，保持校准提示，不更新其他状态
@@ -1709,7 +1757,10 @@ class PostureMainWindow(QMainWindow):
             # 校准进行中：保持显示校准提示文本和样式
             self._set_status_banner("状态: 校准采集中，请保持端正姿势...", "attention")
         elif not posture_check_enabled:
-            self._set_status_banner("状态: 坐姿检测已关闭", "paused")
+            if sedentary_alert_active:
+                self._set_status_banner(f"久坐提醒: {', '.join(sedentary_issues)}", "warning")
+            else:
+                self._set_status_banner("状态: 坐姿检测已关闭", "paused")
         elif is_calibrated:
             # 已校准：正常显示检测状态
             analyzer = self.video_thread.analyzer if current_mode == 'pose' else self.video_thread.face_analyzer
