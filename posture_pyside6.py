@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QCheckBox, QGroupBox, QFrame, QScrollArea, QComboBox, QProgressBar, QSizePolicy
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QEvent
 from PySide6.QtGui import QImage, QPixmap, QPalette, QColor, QFont
 
 # 某些 OpenCV 构建会在导入后覆盖 Qt 插件路径，这里再次锁定到 PySide6。
@@ -407,12 +407,6 @@ class PostureAnalyzer:
         self.torso_ratio_history = deque(maxlen=20)
         self.neck_ratio_history = deque(maxlen=20)
 
-        # 久坐提醒设置
-        self.sedentary_start_time = time.time()
-        self.sedentary_threshold = 45 * 60
-        self.enable_sedentary = True
-        self.sedentary_warning_sent = False
-        
         # --- 风险分数核心参数 ---
         self.risk_score = 0.0
         self.growth_speed = 15.0  # 默认增加速度
@@ -510,18 +504,7 @@ class PostureAnalyzer:
 
         # 3. 判定状态
         current_time = time.time()
-        is_sedentary = False
-        if self.enable_sedentary:
-            if current_time - self.sedentary_start_time > self.sedentary_threshold:
-                is_sedentary = True
-                issues.append("您已久坐，请起身活动！")
-                if not self.sedentary_warning_sent:
-                    self.last_speech_time = 0 
-                    self.sedentary_warning_sent = True 
-            else: self.sedentary_warning_sent = False
-        
-        if is_sedentary: status = "Warning"
-        elif self.risk_score > 60: status = "Warning"
+        if self.risk_score > 60: status = "Warning"
         elif self.risk_score > 25: status = "Attention"
         else: status = "Good"
         
@@ -532,27 +515,6 @@ class PostureAnalyzer:
                 self.last_speech_time = current_time
             
         return status, issues
-
-    def check_sedentary_alert(self):
-        """独立检查久坐提醒，不依赖坐姿检测/校准状态。"""
-        if not self.enable_sedentary:
-            return False, []
-
-        current_time = time.time()
-        if current_time - self.sedentary_start_time <= self.sedentary_threshold:
-            self.sedentary_warning_sent = False
-            return False, []
-
-        issues = ["您已久坐，请起身活动！"]
-        if not self.sedentary_warning_sent:
-            self.last_speech_time = 0
-            self.sedentary_warning_sent = True
-
-        if current_time - self.last_speech_time > self.speech_cooldown:
-            triggered = self.trigger_voice_alert(issues)
-            if triggered:
-                self.last_speech_time = current_time
-        return True, issues
 
     # 功能：当 issues 为空时，根据当前风险分进行“兜底语音”
     def trigger_voice_alert(self, issues):
@@ -588,10 +550,6 @@ class PostureAnalyzer:
         print(f"[语音播报] {alert_text}")
         return speak_chinese_async(alert_text, rate=150)
 
-    def reset_sedentary_timer(self):
-        self.sedentary_start_time = time.time()
-        self.sedentary_warning_sent = False
-
 
 # ==================== 笔记本面部模式分析类 ====================
 class LaptopFaceAnalyzer:
@@ -615,12 +573,6 @@ class LaptopFaceAnalyzer:
         self.draw_scale_points = []
         self.draw_z_points = []
         
-        # ✅ 久坐提醒设置（与 PostureAnalyzer 保持一致）
-        self.sedentary_start_time = time.time()
-        self.sedentary_threshold = 45 * 60  # 默认45分钟
-        self.enable_sedentary = True
-        self.sedentary_warning_sent = False
-
     def reset_calibration(self):
         self.baseline_scale = None
         self.baseline_z_diff = None
@@ -667,23 +619,9 @@ class LaptopFaceAnalyzer:
             
         self.risk_score = max(0.0, min(100.0, self.risk_score))
         
-        # ✅ 久坐检测逻辑（与 PostureAnalyzer 保持一致）
+        # 状态判定
         current_time = time.time()
-        is_sedentary = False
-        if self.enable_sedentary:
-            if current_time - self.sedentary_start_time > self.sedentary_threshold:
-                is_sedentary = True
-                issues.append("您已久坐，请起身活动！")
-                if not self.sedentary_warning_sent:
-                    self.last_speech_time = 0  # 强制触发语音
-                    self.sedentary_warning_sent = True
-            else:
-                self.sedentary_warning_sent = False
-        
-        # 状态判定（优先久坐警告）
-        if is_sedentary:
-            status = "Warning"
-        elif self.risk_score > 60:
+        if self.risk_score > 60:
             status = "Warning"
         elif self.risk_score > 30:
             status = "Attention"
@@ -697,27 +635,6 @@ class LaptopFaceAnalyzer:
                 self.last_speech_time = current_time
         
         return status, issues
-
-    def check_sedentary_alert(self):
-        """独立检查久坐提醒，不依赖坐姿检测/校准状态。"""
-        if not self.enable_sedentary:
-            return False, []
-
-        current_time = time.time()
-        if current_time - self.sedentary_start_time <= self.sedentary_threshold:
-            self.sedentary_warning_sent = False
-            return False, []
-
-        issues = ["您已久坐，请起身活动！"]
-        if not self.sedentary_warning_sent:
-            self.last_speech_time = 0
-            self.sedentary_warning_sent = True
-
-        if current_time - self.last_speech_time > self.speech_cooldown:
-            triggered = self.trigger_voice_alert(issues)
-            if triggered:
-                self.last_speech_time = current_time
-        return True, issues
 
     # 恢复旧版稳定实现 
     def trigger_voice_alert(self, issues):
@@ -757,11 +674,57 @@ class LaptopFaceAnalyzer:
     def set_down_sensitivity(self, factor):
         self.DOWN_MAX = self.BASE_DOWN_MAX / (factor if factor > 0 else 1.0)
 
-    # 添加久坐计时器重置方法 
-    def reset_sedentary_timer(self):
-        """重置久坐计时器（与 PostureAnalyzer 保持一致）"""
-        self.sedentary_start_time = time.time()
-        self.sedentary_warning_sent = False
+class SedentaryReminder:
+    """独立久坐提醒：只受自身开关、周期和重置操作影响。"""
+    def __init__(self, threshold_minutes=45, speech_cooldown=5.0):
+        self.enabled = True
+        self.threshold_seconds = int(threshold_minutes * 60)
+        self.speech_cooldown = speech_cooldown
+        self.start_time = time.time()
+        self.last_speech_time = 0.0
+        self.warning_active = False
+
+    def set_enabled(self, enabled, reset_when_enabled=True):
+        was_enabled = self.enabled
+        self.enabled = bool(enabled)
+        if self.enabled and (reset_when_enabled or not was_enabled):
+            self.reset()
+        elif not self.enabled:
+            self.warning_active = False
+            self.last_speech_time = 0.0
+
+    def set_threshold_minutes(self, minutes):
+        self.threshold_seconds = max(60, int(minutes) * 60)
+
+    def reset(self):
+        self.start_time = time.time()
+        self.last_speech_time = 0.0
+        self.warning_active = False
+
+    def tick(self):
+        if not self.enabled:
+            return {"enabled": False, "alert": False, "remaining_seconds": 0}
+
+        current_time = time.time()
+        remaining_seconds = self.threshold_seconds - (current_time - self.start_time)
+        if remaining_seconds > 0:
+            self.warning_active = False
+            return {
+                "enabled": True,
+                "alert": False,
+                "remaining_seconds": int(math.ceil(remaining_seconds)),
+            }
+
+        if not self.warning_active:
+            self.warning_active = True
+            self.last_speech_time = 0.0
+
+        if current_time - self.last_speech_time > self.speech_cooldown:
+            triggered = speak_chinese_async("久坐提醒，请起身活动。", rate=150)
+            if triggered:
+                self.last_speech_time = current_time
+
+        return {"enabled": True, "alert": True, "remaining_seconds": 0}
 
 
 # ==================== 视频处理线程 ====================
@@ -1014,6 +977,41 @@ class CtrlWheelSlider(QSlider):
         event.ignore()
 
 
+class NoWheelComboBox(QComboBox):
+    """完全禁用鼠标滚轮，避免下拉框被误切换或滚动。"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._install_no_wheel_filter()
+
+    def wheelEvent(self, event):
+        event.accept()
+
+    def showPopup(self):
+        self._install_no_wheel_filter()
+        super().showPopup()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Wheel:
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _install_no_wheel_filter(self):
+        view = self.view()
+        if view is None:
+            return
+
+        targets = [
+            view,
+            view.viewport(),
+            view.verticalScrollBar(),
+            view.horizontalScrollBar(),
+        ]
+        for target in targets:
+            if target is not None:
+                target.installEventFilter(self)
+
+
 def create_slider_row(label_text, min_v, max_v, def_v, callback):
     """辅助函数：创建带标签、滑块和数值显示的行布局"""
     row_layout = QHBoxLayout()
@@ -1045,6 +1043,7 @@ class PostureMainWindow(QMainWindow):
         self.setMinimumSize(1280, 780)
         self.video_width = 820
         self.video_height = 620
+        self.sedentary_reminder = SedentaryReminder()
         
         # 1. 首先初始化所有需要被引用的成员变量 (Widget 实例)
         self.init_ui_components()
@@ -1135,6 +1134,11 @@ class PostureMainWindow(QMainWindow):
 
         self.last_error_speech_time = 0
         self.load_settings() # 加载历史配置
+        self._sync_sedentary_settings(reset_when_enabled=False)
+        self.sedentary_timer = QTimer(self)
+        self.sedentary_timer.timeout.connect(self.update_sedentary_reminder)
+        self.sedentary_timer.start(1000)
+        self.update_sedentary_reminder()
 
         # 添加 F5 快捷键支持
         from PySide6.QtGui import QKeySequence
@@ -1399,13 +1403,13 @@ class PostureMainWindow(QMainWindow):
         l = QVBoxLayout(group)
         
         l.addWidget(QLabel("摄像头源:"))
-        self.cam_combo = QComboBox()
+        self.cam_combo = NoWheelComboBox()
         self.cam_combo.addItems(["摄像头 0", "摄像头 1", "摄像头 2"])
         self.cam_combo.currentIndexChanged.connect(self.on_cam_source_changed)
         l.addWidget(self.cam_combo)
 
         l.addWidget(QLabel("场景模式:"))
-        self.mode_combo = QComboBox()
+        self.mode_combo = NoWheelComboBox()
         self.mode_combo.addItems(["标准模式 (检测上半身)", "专注模式 (仅检测面部)"])
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         l.addWidget(self.mode_combo)
@@ -1622,31 +1626,44 @@ class PostureMainWindow(QMainWindow):
             self.pause_btn.setText("暂停检测")
             # 恢复时先显示黑屏，等待线程唤醒
             self.video_label.setPixmap(self.black_pixmap)
-            # 恢复时重置两个分析器的久坐计时
-            self.video_thread.analyzer.reset_sedentary_timer()
-            self.video_thread.face_analyzer.reset_sedentary_timer()
 
-    # 久坐开关回调逻辑 
+    def _sync_sedentary_settings(self, reset_when_enabled=False):
+        self.sedentary_reminder.set_threshold_minutes(self.sedentary_slider.value())
+        self.sedentary_reminder.set_enabled(
+            self.enable_sedentary_check.isChecked(),
+            reset_when_enabled=reset_when_enabled,
+        )
+
+    def update_sedentary_reminder(self):
+        state = self.sedentary_reminder.tick()
+        if not state["enabled"]:
+            self.countdown_label.setText("久坐提醒: 已关闭")
+            self._set_countdown_style("off")
+            return
+
+        if state["alert"]:
+            self.countdown_label.setText("该起身活动了")
+            self._set_countdown_style("alert")
+            return
+
+        remaining_seconds = state["remaining_seconds"]
+        mins, secs = divmod(remaining_seconds, 60)
+        self.countdown_label.setText(f"久坐倒计时: {mins:02d}:{secs:02d}")
+        self._set_countdown_style("soon" if remaining_seconds < 300 else "normal")
+
+    # 久坐开关回调逻辑
     def on_sedentary_toggle(self, state):
-        # 使用 isChecked() 获取准确的布尔值
-        is_enabled = self.enable_sedentary_check.isChecked()
-        
-        # ✅ 同时更新两个分析器的开关
-        self.video_thread.analyzer.enable_sedentary = is_enabled
-        self.video_thread.face_analyzer.enable_sedentary = is_enabled  
-        
-        # 如果重新开启，建议重置计时器
-        if is_enabled:
-            self.video_thread.analyzer.reset_sedentary_timer()
-            self.video_thread.face_analyzer.reset_sedentary_timer()
+        del state
+        self.sedentary_reminder.set_enabled(
+            self.enable_sedentary_check.isChecked(),
+            reset_when_enabled=True,
+        )
+        self.update_sedentary_reminder()
 
     def on_sedentary_changed(self, value):
         self.sedentary_label.setText(f"{value}分钟")
-        
-        # ✅ 同时更新两个分析器的阈值
-        threshold_seconds = value * 60
-        self.video_thread.analyzer.sedentary_threshold = threshold_seconds
-        self.video_thread.face_analyzer.sedentary_threshold = threshold_seconds
+        self.sedentary_reminder.set_threshold_minutes(value)
+        self.update_sedentary_reminder()
 
     def on_voice_mute_toggled(self, checked):
         self.voice_mute_btn.setText("取消静音" if checked else "静音")
@@ -1672,10 +1689,8 @@ class PostureMainWindow(QMainWindow):
         self._set_risk_bar_color("#4CAF50")
         
     def reset_sedentary_timer(self):
-        # ✅ 同时重置两个分析器的计时器
-        self.video_thread.analyzer.reset_sedentary_timer()
-        self.video_thread.face_analyzer.reset_sedentary_timer()  
-        self._set_status_banner("状态: 久坐计时已重置", "info")
+        self.sedentary_reminder.reset()
+        self.update_sedentary_reminder()
 
     def on_test_tts_clicked(self):
         self._set_status_banner("状态: 正在测试语音播报", "info")
@@ -1708,28 +1723,11 @@ class PostureMainWindow(QMainWindow):
         calibration_countdown = data['calibration_countdown']
         current_mode = data.get('mode', 'pose')
 
-        # 2. 久坐倒计时逻辑
-        if self.video_thread.analyzer.enable_sedentary:
-            elapsed_time = time.time() - self.video_thread.analyzer.sedentary_start_time
-            remaining_seconds = self.video_thread.analyzer.sedentary_threshold - elapsed_time
-            if remaining_seconds <= 0:
-                self.countdown_label.setText("该起身活动了")
-                self._set_countdown_style("alert")
-            else:
-                mins, secs = divmod(int(remaining_seconds), 60)
-                self.countdown_label.setText(f"久坐倒计时: {mins:02d}:{secs:02d}")
-                self._set_countdown_style("soon" if remaining_seconds < 300 else "normal")
-        else:
-            self.countdown_label.setText("久坐提醒: 已关闭")
-            self._set_countdown_style("off")
-        
-        # 3. 状态检查与缓存逻辑
+        # 2. 状态检查与缓存逻辑
         current_status = self.cached_status
         current_issues = self.cached_issues
         is_calibrated = False
         posture_check_enabled = self.enable_posture_check.isChecked()
-        sedentary_alert_active = False
-        sedentary_issues = []
 
         if posture_check_enabled:
             if current_mode == 'pose':
@@ -1746,21 +1744,14 @@ class PostureMainWindow(QMainWindow):
                         self.cached_status, self.cached_issues = current_status, current_issues
         else:
             self._reset_posture_risk_state()
-            sedentary_alert_active, sedentary_issues = self.video_thread.analyzer.check_sedentary_alert()
-            if sedentary_alert_active:
-                current_status = "Warning"
-                current_issues = sedentary_issues
 
-        # 4. 更新风险条与状态标签
+        # 3. 更新风险条与状态标签
         # ✅ 优先判断：如果正在校准中，保持校准提示，不更新其他状态
         if calibration_countdown > 0:
             # 校准进行中：保持显示校准提示文本和样式
             self._set_status_banner("状态: 校准采集中，请保持端正姿势...", "attention")
         elif not posture_check_enabled:
-            if sedentary_alert_active:
-                self._set_status_banner(f"久坐提醒: {', '.join(sedentary_issues)}", "warning")
-            else:
-                self._set_status_banner("状态: 坐姿检测已关闭", "paused")
+            self._set_status_banner("状态: 坐姿检测已关闭", "paused")
         elif is_calibrated:
             # 已校准：正常显示检测状态
             analyzer = self.video_thread.analyzer if current_mode == 'pose' else self.video_thread.face_analyzer
@@ -1782,7 +1773,7 @@ class PostureMainWindow(QMainWindow):
             # 未校准状态
             self._set_status_banner("状态: 未校准 (请保持端正后点击校准)", "neutral")
 
-        # 5. 绘图与显示
+        # 4. 绘图与显示
         if not self.video_thread.show_video:
             self.video_label.setPixmap(self.hidden_pixmap)
             return
