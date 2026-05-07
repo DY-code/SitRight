@@ -675,7 +675,7 @@ class LaptopFaceAnalyzer:
         self.DOWN_MAX = self.BASE_DOWN_MAX / (factor if factor > 0 else 1.0)
 
 class SedentaryReminder:
-    """独立久坐提醒：只受自身开关、周期和重置操作影响。"""
+    """独立久坐提醒：只受自身开关、周期、暂停和重置操作影响。"""
     def __init__(self, threshold_minutes=45, speech_cooldown=5.0):
         self.enabled = True
         self.threshold_seconds = int(threshold_minutes * 60)
@@ -683,6 +683,8 @@ class SedentaryReminder:
         self.start_time = time.time()
         self.last_speech_time = 0.0
         self.warning_active = False
+        self.paused = False
+        self.paused_remaining_seconds = 0
 
     def set_enabled(self, enabled, reset_when_enabled=True):
         was_enabled = self.enabled
@@ -692,18 +694,62 @@ class SedentaryReminder:
         elif not self.enabled:
             self.warning_active = False
             self.last_speech_time = 0.0
+            self.paused = False
+            self.paused_remaining_seconds = 0
 
     def set_threshold_minutes(self, minutes):
         self.threshold_seconds = max(60, int(minutes) * 60)
+        if self.paused:
+            self.paused_remaining_seconds = min(
+                self.paused_remaining_seconds,
+                self.threshold_seconds,
+            )
 
     def reset(self):
         self.start_time = time.time()
         self.last_speech_time = 0.0
         self.warning_active = False
+        self.paused = False
+        self.paused_remaining_seconds = 0
+
+    def _current_remaining_seconds(self):
+        remaining = self.threshold_seconds - (time.time() - self.start_time)
+        return max(0, int(math.ceil(remaining)))
+
+    def pause(self):
+        if not self.enabled or self.paused:
+            return
+        self.paused_remaining_seconds = self._current_remaining_seconds()
+        self.paused = True
+        self.last_speech_time = 0.0
+
+    def resume(self):
+        if not self.enabled or not self.paused:
+            return
+        elapsed_seconds = self.threshold_seconds - self.paused_remaining_seconds
+        self.start_time = time.time() - elapsed_seconds
+        self.paused = False
+        if self.paused_remaining_seconds > 0:
+            self.warning_active = False
+        self.paused_remaining_seconds = 0
+
+    def toggle_pause(self):
+        if self.paused:
+            self.resume()
+        else:
+            self.pause()
 
     def tick(self):
         if not self.enabled:
-            return {"enabled": False, "alert": False, "remaining_seconds": 0}
+            return {"enabled": False, "paused": False, "alert": False, "remaining_seconds": 0}
+
+        if self.paused:
+            return {
+                "enabled": True,
+                "paused": True,
+                "alert": False,
+                "remaining_seconds": self.paused_remaining_seconds,
+            }
 
         current_time = time.time()
         remaining_seconds = self.threshold_seconds - (current_time - self.start_time)
@@ -711,6 +757,7 @@ class SedentaryReminder:
             self.warning_active = False
             return {
                 "enabled": True,
+                "paused": False,
                 "alert": False,
                 "remaining_seconds": int(math.ceil(remaining_seconds)),
             }
@@ -724,7 +771,7 @@ class SedentaryReminder:
             if triggered:
                 self.last_speech_time = current_time
 
-        return {"enabled": True, "alert": True, "remaining_seconds": 0}
+        return {"enabled": True, "paused": False, "alert": True, "remaining_seconds": 0}
 
 
 # ==================== 视频处理线程 ====================
@@ -1344,6 +1391,8 @@ class PostureMainWindow(QMainWindow):
         self.enable_sedentary_check = QCheckBox("启用久坐提醒")
         self.enable_sedentary_check.setChecked(True)
         self.enable_sedentary_check.stateChanged.connect(self.on_sedentary_toggle)
+        self.pause_sedentary_btn = QPushButton("暂停计时")
+        self.pause_sedentary_btn.clicked.connect(self.toggle_sedentary_pause)
         self.reset_timer_btn = QPushButton("重置计时")
         self.reset_timer_btn.clicked.connect(self.reset_sedentary_timer)
         self.test_tts_btn = QPushButton("测试语音播报")
@@ -1454,6 +1503,7 @@ class PostureMainWindow(QMainWindow):
         ctrl_l = QHBoxLayout()
         ctrl_l.addWidget(self.enable_sedentary_check)
         ctrl_l.addStretch()
+        ctrl_l.addWidget(self.pause_sedentary_btn)
         ctrl_l.addWidget(self.reset_timer_btn)
         l.addLayout(ctrl_l)
         
@@ -1636,8 +1686,17 @@ class PostureMainWindow(QMainWindow):
 
     def update_sedentary_reminder(self):
         state = self.sedentary_reminder.tick()
+        self.pause_sedentary_btn.setEnabled(state["enabled"])
+        self.pause_sedentary_btn.setText("继续计时" if state["paused"] else "暂停计时")
         if not state["enabled"]:
             self.countdown_label.setText("久坐提醒: 已关闭")
+            self._set_countdown_style("off")
+            return
+
+        if state["paused"]:
+            remaining_seconds = state["remaining_seconds"]
+            mins, secs = divmod(remaining_seconds, 60)
+            self.countdown_label.setText(f"久坐计时已暂停: {mins:02d}:{secs:02d}")
             self._set_countdown_style("off")
             return
 
@@ -1690,6 +1749,10 @@ class PostureMainWindow(QMainWindow):
         
     def reset_sedentary_timer(self):
         self.sedentary_reminder.reset()
+        self.update_sedentary_reminder()
+
+    def toggle_sedentary_pause(self):
+        self.sedentary_reminder.toggle_pause()
         self.update_sedentary_reminder()
 
     def on_test_tts_clicked(self):
